@@ -245,6 +245,10 @@ const (
 	// JSAdvisoryConsumerMsgTerminatedPre is a notification published when a message has been terminated.
 	JSAdvisoryConsumerMsgTerminatedPre = "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED"
 
+	// JSAdvisoryConsumerCalloutRejectedPre is a notification published when a message's
+	// delivery callout returned a no-go.
+	JSAdvisoryConsumerCalloutRejectedPre = "$JS.EVENT.ADVISORY.CONSUMER.CALLOUT_REJECTED"
+
 	// JSAdvisoryStreamCreatedPre notification that a stream was created.
 	JSAdvisoryStreamCreatedPre = "$JS.EVENT.ADVISORY.STREAM.CREATED"
 

@@ -4456,6 +4456,54 @@ func removeHeaderStatusIfPresent(hdr []byte) []byte {
 	return hdr
 }
 
+// statusFromHeader extracts a numeric status code and optional description
+// from hdr, if present. Two forms are recognized so that any ordinary NATS
+// client library can produce one without special-casing the wire protocol:
+//
+//   - A plain "Status" header field (with an optional "Description" field),
+//     the form any client sets via its normal header API (e.g. msg.Respond
+//     with Header["Status"] = "403"). This is the primary, expected form.
+//   - A leading inlined "NATS/1.0 <code> [<description>]" status line, the
+//     form nats-server itself generates for control messages (e.g. 503 no
+//     responders). Accepted for compatibility with such producers.
+func statusFromHeader(hdr []byte) (code int, description string, ok bool) {
+	if len(hdr) == 0 {
+		return 0, _EMPTY_, false
+	}
+	if v := getHeader("Status", hdr); len(v) > 0 {
+		c, err := strconv.Atoi(string(v))
+		if err != nil {
+			return 0, _EMPTY_, false
+		}
+		if d := getHeader("Description", hdr); len(d) > 0 {
+			description = string(d)
+		}
+		return c, description, true
+	}
+
+	k := []byte("NATS/1.0")
+	if !bytes.HasPrefix(hdr, k) {
+		return 0, _EMPTY_, false
+	}
+	line := hdr
+	if i := bytes.IndexByte(hdr, '\r'); i >= 0 {
+		line = hdr[:i]
+	}
+	line = bytes.TrimSpace(line[len(k):])
+	if len(line) == 0 {
+		return 0, _EMPTY_, false
+	}
+	codeStr := line
+	if i := bytes.IndexByte(line, ' '); i >= 0 {
+		codeStr, description = line[:i], string(bytes.TrimSpace(line[i+1:]))
+	}
+	c, err := strconv.Atoi(string(codeStr))
+	if err != nil {
+		return 0, _EMPTY_, false
+	}
+	return c, description, true
+}
+
 // Will remove a header if present.
 func removeHeaderIfPresent(hdr []byte, key string) []byte {
 	for {

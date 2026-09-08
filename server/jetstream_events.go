@@ -162,6 +162,21 @@ type JSConsumerDeliveryTerminatedAdvisory struct {
 // JSConsumerDeliveryTerminatedAdvisoryType is the schema type for JSConsumerDeliveryTerminatedAdvisory
 const JSConsumerDeliveryTerminatedAdvisoryType = "io.nats.jetstream.advisory.v1.terminated"
 
+// JSConsumerCalloutRejectedAdvisory is an advisory informing that a message's
+// delivery callout returned a no-go, so delivery was skipped for now.
+type JSConsumerCalloutRejectedAdvisory struct {
+	TypedEvent
+	Stream     string `json:"stream"`
+	Consumer   string `json:"consumer"`
+	StreamSeq  uint64 `json:"stream_seq"`
+	Deliveries uint64 `json:"deliveries"`
+	Reason     string `json:"reason,omitempty"`
+	Domain     string `json:"domain,omitempty"`
+}
+
+// JSConsumerCalloutRejectedAdvisoryType is the schema type for JSConsumerCalloutRejectedAdvisory
+const JSConsumerCalloutRejectedAdvisoryType = "io.nats.jetstream.advisory.v1.callout_rejected"
+
 // JSSnapshotCreateAdvisory is an advisory sent after a snapshot is successfully started
 type JSSnapshotCreateAdvisory struct {
 	TypedEvent

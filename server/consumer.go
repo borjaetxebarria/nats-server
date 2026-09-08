@@ -106,6 +106,10 @@ type ConsumerConfig struct {
 	FlowControl     bool            `json:"flow_control,omitempty"`
 	HeadersOnly     bool            `json:"headers_only,omitempty"`
 
+	// Callout gates delivery of each message with a synchronous request/reply
+	// to Callout.Subject before the message is handed to the consuming application.
+	Callout *ConsumerCallout `json:"callout,omitempty"`
+
 	// Pull based options.
 	MaxRequestBatch    int           `json:"max_batch,omitempty"`
 	MaxRequestExpires  time.Duration `json:"max_expires,omitempty"`
@@ -137,6 +141,42 @@ type ConsumerConfig struct {
 	PriorityGroups []string       `json:"priority_groups,omitempty"`
 	PriorityPolicy PriorityPolicy `json:"priority_policy,omitempty"`
 	PinnedTTL      time.Duration  `json:"priority_timeout,omitempty"`
+}
+
+// ConsumerCallout configures a per-message go/no-go gate: before a message is
+// delivered (push) or returned from a pull request, the server sends a request
+// to Subject carrying the selected subset of the message's subject/headers/payload
+// and waits for a reply. A reply with no "Status" header, or with "Status" in
+// 100-299, is treated as "go". A reply with "Status" >= 300, or a timeout, is
+// treated as "no-go" and the message is redelivered later instead of delivered now.
+type ConsumerCallout struct {
+	// Subject is the request target for the callout. Required.
+	Subject string `json:"subject"`
+	// IncludeSubject, if true, carries the message's original subject in the
+	// request via the Nats-Subject header.
+	IncludeSubject bool `json:"include_subject,omitempty"`
+	// IncludeHeaders, if true, carries the message's original headers in the request.
+	IncludeHeaders bool `json:"include_headers,omitempty"`
+	// IncludePayload, if true, carries the message's original payload in the request.
+	IncludePayload bool `json:"include_payload,omitempty"`
+	// Timeout bounds how long the server waits for a callout reply. Defaults to
+	// consumerCalloutDefaultTimeout when unset.
+	Timeout time.Duration `json:"timeout,omitempty"`
+}
+
+// consumerCalloutDefaultTimeout is used when ConsumerCallout.Timeout is unset.
+// It is intentionally independent of AckWait: the callout is a synchronous,
+// per-message wait on the single consumer delivery goroutine, so a short bound
+// keeps the stall this introduces (on acks, pull requests, config updates) small.
+const consumerCalloutDefaultTimeout = 2 * time.Second
+
+// consumerCalloutEqual reports whether two (possibly nil) ConsumerCallout
+// configs are equivalent.
+func consumerCalloutEqual(a, b *ConsumerCallout) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // SequenceInfo has both the consumer and the stream sequence and last activity.
@@ -458,6 +498,9 @@ type consumer struct {
 	fcid              string
 	fcSubOld          *subscription
 	fcSub             *subscription
+	calloutSub        *subscription
+	calloutReply      string
+	calloutCh         chan []byte
 	outq              *jsOutQ
 	pending           map[uint64]*Pending
 	ptmr              *time.Timer
@@ -738,6 +781,19 @@ func checkConsumerCfg(
 
 	if len(config.Description) > JSMaxDescriptionLen {
 		return NewJSConsumerDescriptionTooLongError(JSMaxDescriptionLen)
+	}
+
+	// Validate the delivery callout, if configured. Applies identically to push and pull.
+	if co := config.Callout; co != nil {
+		if co.Subject == _EMPTY_ {
+			return NewJSConsumerCalloutSubjectRequiredError()
+		}
+		if !subjectIsLiteral(co.Subject) || !IsValidSubject(co.Subject) {
+			return NewJSConsumerCalloutInvalidSubjectError()
+		}
+		if co.Timeout < 0 {
+			return NewJSConsumerCalloutTimeoutNegativeError()
+		}
 	}
 
 	// For now expect a literal subject if its not empty. Empty means work queue mode (pull mode).
@@ -1660,6 +1716,14 @@ func (o *consumer) setLeader(isLeader bool) {
 			}
 		}
 
+		// Set up the internal reply subscription for the delivery callout, if configured.
+		if o.cfg.Callout != nil {
+			if err = o.setupCalloutSubLocked(); err != nil {
+				o.mu.Unlock()
+				return
+			}
+		}
+
 		// If push mode, register for notifications on interest.
 		if o.isPushMode() {
 			o.inch = make(chan bool, 8)
@@ -1772,7 +1836,9 @@ func (o *consumer) setLeader(isLeader bool) {
 		o.unsubscribe(o.resetSub)
 		o.unsubscribe(o.fcSubOld)
 		o.unsubscribe(o.fcSub)
+		o.unsubscribe(o.calloutSub)
 		o.ackSubOld, o.ackSub, o.reqSub, o.resetSub, o.fcSubOld, o.fcSub = nil, nil, nil, nil, nil, nil
+		o.calloutSub, o.calloutReply = nil, _EMPTY_
 		if o.infoSub != nil {
 			o.srv.sysUnsubscribe(o.infoSub)
 			o.infoSub = nil
@@ -1849,6 +1915,141 @@ func (o *consumer) sendAdvisory(subject string, e any) {
 	}
 
 	o.outq.sendMsg(subject, j)
+}
+
+// returnMsgUndelivered puts pmsg back for redelivery instead of delivering it
+// now — either because no pull request was waiting for it, or because a
+// delivery callout rejected it. Lock should be held. Does not return pmsg to
+// the pool; callers do that themselves.
+func (o *consumer) returnMsgUndelivered(pmsg *jsPubMsg, dc uint64) {
+	// We will redo this one as long as this is not a redelivery.
+	// Need to also test that this is not going backwards since if
+	// we fail to deliver we can end up here from rdq but we do not
+	// want to decrement o.sseq if that is the case.
+	if dc == 1 && pmsg.seq == o.sseq-1 {
+		o.sseq--
+		o.npc++
+	} else if !o.onRedeliverQueue(pmsg.seq) {
+		// We are not on the rdq so decrement the delivery count
+		// and add it back.
+		o.decDeliveryCount(pmsg.seq)
+		o.addToRedeliverQueue(pmsg.seq)
+	}
+}
+
+// setupCalloutSubLocked (re)creates the internal reply subscription used to
+// receive delivery-callout responses, tearing down any existing one first.
+// Lock should be held.
+func (o *consumer) setupCalloutSubLocked() error {
+	o.unsubscribe(o.calloutSub)
+	o.calloutSub, o.calloutReply = nil, _EMPTY_
+
+	if o.cfg.Callout == nil {
+		return nil
+	}
+	reply := o.srv.newRespInbox()
+	sub, err := o.subscribeInternal(reply, o.processCalloutReply)
+	if err != nil {
+		return err
+	}
+	o.calloutSub, o.calloutReply = sub, reply
+	if o.calloutCh == nil {
+		o.calloutCh = make(chan []byte, 1)
+	}
+	return nil
+}
+
+// processCalloutReply handles the reply to a delivery-callout request.
+// This is coming in on the wire so must not block.
+func (o *consumer) processCalloutReply(_ *subscription, c *client, _ *Account, _, _ string, rmsg []byte) {
+	var hdr []byte
+	if c.pa.hdr > 0 {
+		hdr = rmsg[:c.pa.hdr]
+	}
+	o.mu.RLock()
+	ch := o.calloutCh
+	o.mu.RUnlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- copyBytes(hdr):
+	default:
+	}
+}
+
+// buildCalloutRequest builds the delivery-callout request headers/payload for
+// pmsg according to co's include flags. Lock does not need to be held.
+func (o *consumer) buildCalloutRequest(co *ConsumerCallout, pmsg *jsPubMsg) (hdr, payload []byte) {
+	if co.IncludeHeaders && len(pmsg.hdr) > 0 {
+		hdr = removeHeaderStatusIfPresent(copyBytes(pmsg.hdr))
+	}
+	if co.IncludeSubject {
+		hdr = genHeader(hdr, JSSubject, pmsg.subj)
+	}
+	if co.IncludePayload {
+		payload = pmsg.msg
+	}
+	return hdr, payload
+}
+
+// runCallout sends the delivery-callout request built from hdr/payload and
+// blocks until a reply arrives, the timeout elapses, or qch fires. Lock must
+// NOT be held while this runs — it is a synchronous network round trip.
+// Failure of any kind (timeout, send error, consumer shutdown) is treated as
+// "no-go" (fail-closed): the caller redelivers the message later rather than
+// dropping it or delivering on an inconclusive result.
+func (o *consumer) runCallout(co *ConsumerCallout, hdr, payload []byte, qch chan struct{}) (goDecision bool, reason string) {
+	o.mu.RLock()
+	s, acc, reply, ch := o.srv, o.acc, o.calloutReply, o.calloutCh
+	o.mu.RUnlock()
+
+	if reply == _EMPTY_ || ch == nil {
+		return false, "callout not configured"
+	}
+	if err := s.sendInternalAccountMsgWithReply(acc, co.Subject, reply, hdr, payload, false); err != nil {
+		return false, err.Error()
+	}
+
+	timeout := co.Timeout
+	if timeout <= 0 {
+		timeout = consumerCalloutDefaultTimeout
+	}
+
+	select {
+	case <-qch:
+		return false, "consumer shutdown"
+	case respHdr := <-ch:
+		if code, desc, ok := statusFromHeader(respHdr); ok && code >= 300 {
+			if desc == _EMPTY_ {
+				desc = strconv.Itoa(code)
+			}
+			return false, desc
+		}
+		return true, _EMPTY_
+	case <-time.After(timeout):
+		return false, "callout timeout"
+	}
+}
+
+// sendCalloutRejectedAdvisory publishes an advisory when a delivery callout
+// rejects a message. Lock should be held.
+func (o *consumer) sendCalloutRejectedAdvisory(seq, dc uint64, reason string) {
+	e := JSConsumerCalloutRejectedAdvisory{
+		TypedEvent: TypedEvent{
+			Type: JSConsumerCalloutRejectedAdvisoryType,
+			ID:   nuid.Next(),
+			Time: time.Now().UTC(),
+		},
+		Stream:     o.stream,
+		Consumer:   o.name,
+		StreamSeq:  seq,
+		Deliveries: dc,
+		Reason:     reason,
+		Domain:     o.srv.getOpts().JetStreamDomain,
+	}
+	subj := JSAdvisoryConsumerCalloutRejectedPre + "." + o.stream + "." + o.name
+	o.sendAdvisory(subj, e)
 }
 
 func (o *consumer) sendDeleteAdvisoryLocked() {
@@ -2441,6 +2642,16 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 	// DeliverSubject
 	if cfg.DeliverSubject != o.cfg.DeliverSubject {
 		o.updateDeliverSubjectLocked(cfg.DeliverSubject)
+	}
+
+	// Callout: (re)create the internal reply subscription if it was
+	// added, removed, or repointed at a different subject. Only meaningful
+	// while we are the leader; otherwise setLeader(true) will set it up fresh.
+	if !consumerCalloutEqual(cfg.Callout, o.cfg.Callout) && o.isLeader() {
+		o.cfg.Callout = cfg.Callout
+		if err := o.setupCalloutSubLocked(); err != nil {
+			return err
+		}
 	}
 
 	// MaxAckPending
@@ -5175,6 +5386,33 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		if dc == 1 {
 			o.npc--
 		}
+
+		// If a delivery callout is configured, gate this message on a go/no-go
+		// reply before it is truncated for HeadersOnly or resolved to a push/pull
+		// destination. This covers both push and pull consumers uniformly since
+		// neither dsubj nor a pull request's batch/byte budget have been touched yet.
+		if co := o.cfg.Callout; co != nil {
+			hdr, payload := o.buildCalloutRequest(co, pmsg)
+			o.mu.Unlock()
+			goDecision, reason := o.runCallout(co, hdr, payload, qch)
+			o.mu.Lock()
+			if o.closed || o.mset == nil {
+				o.mu.Unlock()
+				return
+			}
+			if !goDecision {
+				o.returnMsgUndelivered(pmsg, dc)
+				o.sendCalloutRejectedAdvisory(pmsg.seq, dc, reason)
+				pmsg.returnToPool()
+				pmsg = nil
+				// Unlike the pull-mode "no one waiting" rollback, nothing else
+				// is guaranteed to wake this loop again (push mode has no
+				// equivalent to a new pull request arriving), so signal explicitly.
+				o.signalNewMessages()
+				goto waitForMsgs
+			}
+		}
+
 		// Pre-calculate ackReply
 		ackReply = o.ackReply(pmsg.seq, o.dseq, dc, pmsg.ts, o.numPending())
 
@@ -5213,19 +5451,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 				wr.hbt = time.Now().Add(wr.hb)
 			}
 		} else {
-			// We will redo this one as long as this is not a redelivery.
-			// Need to also test that this is not going backwards since if
-			// we fail to deliver we can end up here from rdq but we do not
-			// want to decrement o.sseq if that is the case.
-			if dc == 1 && pmsg.seq == o.sseq-1 {
-				o.sseq--
-				o.npc++
-			} else if !o.onRedeliverQueue(pmsg.seq) {
-				// We are not on the rdq so decrement the delivery count
-				// and add it back.
-				o.decDeliveryCount(pmsg.seq)
-				o.addToRedeliverQueue(pmsg.seq)
-			}
+			o.returnMsgUndelivered(pmsg, dc)
 			pmsg.returnToPool()
 			pmsg = nil
 			goto waitForMsgs
@@ -6404,12 +6630,15 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	o.unsubscribe(o.resetSub)
 	o.unsubscribe(o.fcSubOld)
 	o.unsubscribe(o.fcSub)
+	o.unsubscribe(o.calloutSub)
 	o.ackSubOld = nil
 	o.ackSub = nil
 	o.reqSub = nil
 	o.resetSub = nil
 	o.fcSubOld = nil
 	o.fcSub = nil
+	o.calloutSub = nil
+	o.calloutReply = _EMPTY_
 	if o.infoSub != nil {
 		o.srv.sysUnsubscribe(o.infoSub)
 		o.infoSub = nil

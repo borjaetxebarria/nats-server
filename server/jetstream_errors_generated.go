@@ -104,6 +104,15 @@ const (
 	// JSConsumerBadDurableNameErr durable name can not contain '.', '*', '>'
 	JSConsumerBadDurableNameErr ErrorIdentifier = 10103
 
+	// JSConsumerCalloutInvalidSubjectErr consumer callout subject must be a valid publishable subject
+	JSConsumerCalloutInvalidSubjectErr ErrorIdentifier = 10214
+
+	// JSConsumerCalloutSubjectRequiredErr consumer callout subject is required
+	JSConsumerCalloutSubjectRequiredErr ErrorIdentifier = 10213
+
+	// JSConsumerCalloutTimeoutNegativeErr consumer callout timeout cannot be negative
+	JSConsumerCalloutTimeoutNegativeErr ErrorIdentifier = 10215
+
 	// JSConsumerConfigRequiredErr consumer config required
 	JSConsumerConfigRequiredErr ErrorIdentifier = 10078
 
@@ -674,6 +683,9 @@ var (
 		JSConsumerAlreadyExists:                      {Code: 400, ErrCode: 10148, Description: "consumer already exists"},
 		JSConsumerBackOffNegativeErr:                 {Code: 400, ErrCode: 10184, Description: "consumer backoff needs to be positive"},
 		JSConsumerBadDurableNameErr:                  {Code: 400, ErrCode: 10103, Description: "durable name can not contain '.', '*', '>'"},
+		JSConsumerCalloutInvalidSubjectErr:           {Code: 400, ErrCode: 10214, Description: "consumer callout subject must be a valid publishable subject"},
+		JSConsumerCalloutSubjectRequiredErr:          {Code: 400, ErrCode: 10213, Description: "consumer callout subject is required"},
+		JSConsumerCalloutTimeoutNegativeErr:          {Code: 400, ErrCode: 10215, Description: "consumer callout timeout cannot be negative"},
 		JSConsumerConfigRequiredErr:                  {Code: 400, ErrCode: 10078, Description: "consumer config required"},
 		JSConsumerCreateDurableAndNameMismatch:       {Code: 400, ErrCode: 10132, Description: "Consumer Durable and Name have to be equal if both are provided"},
 		JSConsumerCreateErrF:                         {Code: 500, ErrCode: 10012, Description: "{err}"},
@@ -1223,6 +1235,36 @@ func NewJSConsumerBadDurableNameError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSConsumerBadDurableNameErr]
+}
+
+// NewJSConsumerCalloutInvalidSubjectError creates a new JSConsumerCalloutInvalidSubjectErr error: "consumer callout subject must be a valid publishable subject"
+func NewJSConsumerCalloutInvalidSubjectError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerCalloutInvalidSubjectErr]
+}
+
+// NewJSConsumerCalloutSubjectRequiredError creates a new JSConsumerCalloutSubjectRequiredErr error: "consumer callout subject is required"
+func NewJSConsumerCalloutSubjectRequiredError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerCalloutSubjectRequiredErr]
+}
+
+// NewJSConsumerCalloutTimeoutNegativeError creates a new JSConsumerCalloutTimeoutNegativeErr error: "consumer callout timeout cannot be negative"
+func NewJSConsumerCalloutTimeoutNegativeError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerCalloutTimeoutNegativeErr]
 }
 
 // NewJSConsumerConfigRequiredError creates a new JSConsumerConfigRequiredErr error: "consumer config required"

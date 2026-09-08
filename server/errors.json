@@ -2108,5 +2108,35 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerCalloutSubjectRequiredErr",
+    "code": 400,
+    "error_code": 10213,
+    "description": "consumer callout subject is required",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerCalloutInvalidSubjectErr",
+    "code": 400,
+    "error_code": 10214,
+    "description": "consumer callout subject must be a valid publishable subject",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerCalloutTimeoutNegativeErr",
+    "code": 400,
+    "error_code": 10215,
+    "description": "consumer callout timeout cannot be negative",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]
