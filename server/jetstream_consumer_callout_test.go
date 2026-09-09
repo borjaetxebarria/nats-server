@@ -67,6 +67,24 @@ func TestJetStreamConsumerCalloutConfigValidation(t *testing.T) {
 		Callout:   &ConsumerCallout{Subject: "callout.subj"},
 	})
 	require_NoError(t, err)
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:   "C5",
+		AckPolicy: AckExplicit,
+		Callout:   &ConsumerCallout{Subject: "callout.subj", Concurrency: -1},
+	})
+	require_Error(t, err)
+	if !IsNatsErr(err, JSConsumerCalloutConcurrencyNegativeErr) {
+		t.Fatalf("want error %q, got %q", ApiErrors[JSConsumerCalloutConcurrencyNegativeErr], err)
+	}
+
+	unordered := false
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:   "C6",
+		AckPolicy: AckExplicit,
+		Callout:   &ConsumerCallout{Subject: "callout.subj", Concurrency: 8, Ordered: &unordered},
+	})
+	require_NoError(t, err)
 }
 
 // calloutResponder subscribes to subj and replies "go" or "no-go" based on an
@@ -327,4 +345,125 @@ func TestJetStreamConsumerCalloutUpdateConfig(t *testing.T) {
 	require_NoError(t, err)
 	require_Equal(t, string(m.Data), "two")
 	require_ChanRead(t, reqChB, 2*time.Second)
+}
+
+// delayedApproveResponder always approves, but sleeps first if the payload
+// has a configured delay — lets a test force completion order to differ from
+// dispatch order.
+func delayedApproveResponder(t *testing.T, nc *nats.Conn, subj string, delays map[string]time.Duration) {
+	t.Helper()
+	// nats.Subscribe dispatches callbacks one at a time from a single
+	// per-subscription goroutine, so without spawning here the configured
+	// delays would just serialize the responder instead of actually racing
+	// concurrent requests against each other.
+	_, err := nc.Subscribe(subj, func(m *nats.Msg) {
+		go func() {
+			if d := delays[string(m.Data)]; d > 0 {
+				time.Sleep(d)
+			}
+			m.Respond(nil)
+		}()
+	})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+}
+
+func TestJetStreamConsumerCalloutPipelineOrdered(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	acc := s.GlobalAccount()
+	mset, err := acc.addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	// "1" resolves slowest, "3" fastest — completion order is reversed from
+	// dispatch order, so this only passes if release ordering is enforced.
+	delayedApproveResponder(t, nc, "CALLOUT.ORDERED", map[string]time.Duration{
+		"1": 300 * time.Millisecond,
+		"2": 150 * time.Millisecond,
+		"3": 0,
+	})
+
+	deliverSubj := "deliver.ordered"
+	sub, err := nc.SubscribeSync(deliverSubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "ORDERED",
+		DeliverSubject: deliverSubj,
+		AckPolicy:      AckExplicit,
+		Callout: &ConsumerCallout{
+			Subject:        "CALLOUT.ORDERED",
+			IncludePayload: true,
+			Concurrency:    3,
+			// Ordered defaults to true.
+		},
+	})
+	require_NoError(t, err)
+
+	for _, m := range []string{"1", "2", "3"} {
+		sendStreamMsg(t, nc, "foo", m)
+	}
+
+	for _, want := range []string{"1", "2", "3"} {
+		m, err := sub.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_Equal(t, string(m.Data), want)
+	}
+}
+
+func TestJetStreamConsumerCalloutPipelineUnordered(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	acc := s.GlobalAccount()
+	mset, err := acc.addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	delayedApproveResponder(t, nc, "CALLOUT.UNORDERED", map[string]time.Duration{
+		"1": 300 * time.Millisecond,
+		"2": 150 * time.Millisecond,
+		"3": 0,
+	})
+
+	deliverSubj := "deliver.unordered"
+	sub, err := nc.SubscribeSync(deliverSubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	unordered := false
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "UNORDERED",
+		DeliverSubject: deliverSubj,
+		AckPolicy:      AckExplicit,
+		Callout: &ConsumerCallout{
+			Subject:        "CALLOUT.UNORDERED",
+			IncludePayload: true,
+			Concurrency:    3,
+			Ordered:        &unordered,
+		},
+	})
+	require_NoError(t, err)
+
+	for _, m := range []string{"1", "2", "3"} {
+		sendStreamMsg(t, nc, "foo", m)
+	}
+
+	// Fastest-resolving ("3") should come back first, not "1" — actually
+	// observe reordering rather than merely tolerate it.
+	want := []string{"3", "2", "1"}
+	for i := range want {
+		m, err := sub.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		if string(m.Data) != want[i] {
+			t.Fatalf("expected out-of-order delivery %v, got %q at position %d", want, m.Data, i)
+		}
+	}
 }

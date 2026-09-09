@@ -149,6 +149,11 @@ type ConsumerConfig struct {
 // and waits for a reply. A reply with no "Status" header, or with "Status" in
 // 100-299, is treated as "go". A reply with "Status" >= 300, or a timeout, is
 // treated as "no-go" and the message is redelivered later instead of delivered now.
+//
+// Concurrency allows up to that many callout requests in flight at once
+// (default 1, today's fully-serial behavior). Ordered (default true) still
+// releases messages to the client in original order even when Concurrency>1;
+// set to false to release each message as soon as its own callout resolves.
 type ConsumerCallout struct {
 	// Subject is the request target for the callout. Required.
 	Subject string `json:"subject"`
@@ -162,6 +167,12 @@ type ConsumerCallout struct {
 	// Timeout bounds how long the server waits for a callout reply. Defaults to
 	// consumerCalloutDefaultTimeout when unset.
 	Timeout time.Duration `json:"timeout,omitempty"`
+	// Concurrency is the maximum number of callout requests in flight at once.
+	// <=0 is treated as 1.
+	Concurrency int `json:"concurrency,omitempty"`
+	// Ordered, when nil or true, releases messages to the client in original
+	// order even with Concurrency>1. Explicit false allows out-of-order release.
+	Ordered *bool `json:"ordered,omitempty"`
 }
 
 // consumerCalloutDefaultTimeout is used when ConsumerCallout.Timeout is unset.
@@ -170,13 +181,41 @@ type ConsumerCallout struct {
 // keeps the stall this introduces (on acks, pull requests, config updates) small.
 const consumerCalloutDefaultTimeout = 2 * time.Second
 
+// concurrency returns the effective in-flight callout limit.
+func (co *ConsumerCallout) concurrency() int {
+	if co.Concurrency <= 0 {
+		return 1
+	}
+	return co.Concurrency
+}
+
+// ordered returns whether release-to-client ordering is preserved.
+func (co *ConsumerCallout) ordered() bool {
+	return co.Ordered == nil || *co.Ordered
+}
+
 // consumerCalloutEqual reports whether two (possibly nil) ConsumerCallout
-// configs are equivalent.
+// configs are equivalent. Manual field comparison since Ordered is a pointer
+// and Go's == would compare pointer identity, not the pointed-to value.
 func consumerCalloutEqual(a, b *ConsumerCallout) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	return *a == *b
+	if a.Subject != b.Subject ||
+		a.IncludeSubject != b.IncludeSubject ||
+		a.IncludeHeaders != b.IncludeHeaders ||
+		a.IncludePayload != b.IncludePayload ||
+		a.Timeout != b.Timeout ||
+		a.Concurrency != b.Concurrency {
+		return false
+	}
+	return a.ordered() == b.ordered()
+}
+
+// needsCalloutSubLocked reports whether this callout config requires the
+// internal wildcard reply subscription (i.e. is configured at all).
+func needsCalloutSubLocked(co *ConsumerCallout) bool {
+	return co != nil
 }
 
 // SequenceInfo has both the consumer and the stream sequence and last activity.
@@ -499,8 +538,9 @@ type consumer struct {
 	fcSubOld          *subscription
 	fcSub             *subscription
 	calloutSub        *subscription
-	calloutReply      string
-	calloutCh         chan []byte
+	calloutReply      string // subject prefix; actual reply-to is calloutReply+token
+	calloutPending    map[string]chan []byte
+	calloutTk         uint64
 	outq              *jsOutQ
 	pending           map[uint64]*Pending
 	ptmr              *time.Timer
@@ -793,6 +833,9 @@ func checkConsumerCfg(
 		}
 		if co.Timeout < 0 {
 			return NewJSConsumerCalloutTimeoutNegativeError()
+		}
+		if co.Concurrency < 0 {
+			return NewJSConsumerCalloutConcurrencyNegativeError()
 		}
 	}
 
@@ -1937,9 +1980,9 @@ func (o *consumer) returnMsgUndelivered(pmsg *jsPubMsg, dc uint64) {
 	}
 }
 
-// setupCalloutSubLocked (re)creates the internal reply subscription used to
-// receive delivery-callout responses, tearing down any existing one first.
-// Lock should be held.
+// setupCalloutSubLocked (re)creates the wildcard internal subscription used to
+// demultiplex delivery-callout replies across potentially many in-flight
+// requests (see runCallout/processCalloutReply).
 func (o *consumer) setupCalloutSubLocked() error {
 	o.unsubscribe(o.calloutSub)
 	o.calloutSub, o.calloutReply = nil, _EMPTY_
@@ -1947,28 +1990,34 @@ func (o *consumer) setupCalloutSubLocked() error {
 	if o.cfg.Callout == nil {
 		return nil
 	}
-	reply := o.srv.newRespInbox()
-	sub, err := o.subscribeInternal(reply, o.processCalloutReply)
+	reply := o.srv.newRespInbox() + "."
+	sub, err := o.subscribeInternal(reply+"*", o.processCalloutReply)
 	if err != nil {
 		return err
 	}
 	o.calloutSub, o.calloutReply = sub, reply
-	if o.calloutCh == nil {
-		o.calloutCh = make(chan []byte, 1)
+	if o.calloutPending == nil {
+		o.calloutPending = make(map[string]chan []byte)
 	}
 	return nil
 }
 
-// processCalloutReply handles the reply to a delivery-callout request.
-// This is coming in on the wire so must not block.
-func (o *consumer) processCalloutReply(_ *subscription, c *client, _ *Account, _, _ string, rmsg []byte) {
+// processCalloutReply handles the reply to a delivery-callout request,
+// routing it to the specific in-flight caller waiting on it (the last subject
+// token identifies which one). This is coming in on the wire so must not block.
+func (o *consumer) processCalloutReply(_ *subscription, c *client, _ *Account, subject, _ string, rmsg []byte) {
 	var hdr []byte
 	if c.pa.hdr > 0 {
 		hdr = rmsg[:c.pa.hdr]
 	}
-	o.mu.RLock()
-	ch := o.calloutCh
-	o.mu.RUnlock()
+	o.mu.Lock()
+	var ch chan []byte
+	if prefix := o.calloutReply; prefix != _EMPTY_ && len(subject) > len(prefix) && subject[:len(prefix)] == prefix {
+		token := subject[len(prefix):]
+		ch = o.calloutPending[token]
+		delete(o.calloutPending, token)
+	}
+	o.mu.Unlock()
 	if ch == nil {
 		return
 	}
@@ -1995,19 +2044,36 @@ func (o *consumer) buildCalloutRequest(co *ConsumerCallout, pmsg *jsPubMsg) (hdr
 
 // runCallout sends the delivery-callout request built from hdr/payload and
 // blocks until a reply arrives, the timeout elapses, or qch fires. Lock must
-// NOT be held while this runs — it is a synchronous network round trip.
-// Failure of any kind (timeout, send error, consumer shutdown) is treated as
-// "no-go" (fail-closed): the caller redelivers the message later rather than
-// dropping it or delivering on an inconclusive result.
+// NOT be held while this runs — it is a synchronous network round trip, and
+// with Concurrency>1 many of these run at once from separate goroutines, each
+// registering its own reply token so processCalloutReply can route replies
+// back to the right caller. Failure of any kind (timeout, send error,
+// consumer shutdown) is treated as "no-go" (fail-closed): the caller
+// redelivers the message later rather than dropping it or delivering on an
+// inconclusive result.
 func (o *consumer) runCallout(co *ConsumerCallout, hdr, payload []byte, qch chan struct{}) (goDecision bool, reason string) {
-	o.mu.RLock()
-	s, acc, reply, ch := o.srv, o.acc, o.calloutReply, o.calloutCh
-	o.mu.RUnlock()
-
-	if reply == _EMPTY_ || ch == nil {
+	o.mu.Lock()
+	s, acc, prefix := o.srv, o.acc, o.calloutReply
+	if prefix == _EMPTY_ {
+		o.mu.Unlock()
 		return false, "callout not configured"
 	}
-	if err := s.sendInternalAccountMsgWithReply(acc, co.Subject, reply, hdr, payload, false); err != nil {
+	o.calloutTk++
+	token := strconv.FormatUint(o.calloutTk, 10)
+	ch := make(chan []byte, 1)
+	if o.calloutPending == nil {
+		o.calloutPending = make(map[string]chan []byte)
+	}
+	o.calloutPending[token] = ch
+	o.mu.Unlock()
+
+	defer func() {
+		o.mu.Lock()
+		delete(o.calloutPending, token)
+		o.mu.Unlock()
+	}()
+
+	if err := s.sendInternalAccountMsgWithReply(acc, co.Subject, prefix+token, hdr, payload, false); err != nil {
 		return false, err.Error()
 	}
 
@@ -2050,6 +2116,219 @@ func (o *consumer) sendCalloutRejectedAdvisory(seq, dc uint64, reason string) {
 	}
 	subj := JSAdvisoryConsumerCalloutRejectedPre + "." + o.stream + "." + o.name
 	o.sendAdvisory(subj, e)
+}
+
+// calloutJob is one message dispatched into a consumerCalloutPipeline.
+type calloutJob struct {
+	pmsg *jsPubMsg
+	dc   uint64
+}
+
+// calloutResult is the outcome of running a callout for a calloutJob.
+type calloutResult struct {
+	job        *calloutJob
+	goDecision bool
+	reason     string
+}
+
+// consumerCalloutPipeline lets up to `limit` delivery-callout requests run
+// concurrently for a consumer, optionally preserving release order to the
+// client even though the underlying requests may complete out of order.
+//
+// Release ordering is keyed by the message's own stream sequence rather than
+// a monotonic dispatch counter: a rejected message is retried (via the
+// rollback in returnMsgUndelivered) under that same sequence, potentially
+// after other, later-sequenced jobs have already been dispatched — a fresh
+// per-dispatch ticket would desync from a simple incrementing release
+// counter the first time any rejection happened. Sequence numbers don't have
+// that problem: a retry of the same message always carries the same
+// sequence, and "is it safe to release this accepted result" is simply "is
+// there no still-unresolved in-flight job with a smaller sequence."
+//
+// Re-synced against o.cfg.Callout at the top of every loop iteration (see
+// loopAndGatherMsgs), so attaching/detaching Callout entirely, or changing
+// Concurrency/Ordered, takes effect on the very next message — a changed
+// pipeline is simply replaced; any jobs still in flight on the old one are
+// abandoned the same way a shutdown mid-flight already is (see next()'s
+// shutdown note). All methods expect o.mu to be held on entry and leave it
+// held on return, exactly like getNextMsg, so it can be dropped in as a
+// direct replacement for a bare o.getNextMsg() call at the one call site
+// that uses it.
+type consumerCalloutPipeline struct {
+	o         *consumer
+	qch       chan struct{}
+	limit     int
+	ordered   bool
+	resultsCh chan *calloutResult // buffered to limit; see next()'s shutdown note
+
+	inflightSeqs map[uint64]struct{}      // dispatched, not yet resolved (a rejected-then-retried job keeps reusing its seq)
+	readyOrd     map[uint64]*calloutResult // accepted, awaiting release order (ordered mode), keyed by seq
+	readyUnord   []*calloutResult          // accepted, ready to release in any order (unordered mode)
+	fetchErr     error
+}
+
+// newConsumerCalloutPipeline returns nil if co is nil. Lock should be held.
+func newConsumerCalloutPipeline(o *consumer, qch chan struct{}) *consumerCalloutPipeline {
+	co := o.cfg.Callout
+	if co == nil {
+		return nil
+	}
+	limit := co.concurrency()
+	p := &consumerCalloutPipeline{
+		o:            o,
+		qch:          qch,
+		limit:        limit,
+		ordered:      co.ordered(),
+		resultsCh:    make(chan *calloutResult, limit),
+		inflightSeqs: make(map[uint64]struct{}, limit),
+	}
+	if p.ordered {
+		p.readyOrd = make(map[uint64]*calloutResult)
+	}
+	return p
+}
+
+// minInflightSeq returns the smallest currently in-flight sequence, if any.
+func (p *consumerCalloutPipeline) minInflightSeq() (uint64, bool) {
+	var min uint64
+	found := false
+	for seq := range p.inflightSeqs {
+		if !found || seq < min {
+			min, found = seq, true
+		}
+	}
+	return min, found
+}
+
+// next returns the next message approved for normal delivery, exactly like
+// o.getNextMsg() (same error sentinels, same "lock held on entry and exit"
+// contract) — the caller's existing post-gate code (ackReply/HeadersOnly/
+// dsubj resolution/deliverMsg) needs no changes to consume it. Internally
+// keeps up to p.limit callouts in flight and, in ordered mode, only releases
+// them in original dispatch order regardless of completion order.
+func (p *consumerCalloutPipeline) next() (*jsPubMsg, uint64, error) {
+	o := p.o
+	for {
+		if p.ordered {
+			var bestSeq uint64
+			var best *calloutResult
+			for seq, r := range p.readyOrd {
+				if best == nil || seq < bestSeq {
+					bestSeq, best = seq, r
+				}
+			}
+			if best != nil {
+				if minSeq, ok := p.minInflightSeq(); !ok || bestSeq < minSeq {
+					delete(p.readyOrd, bestSeq)
+					return best.job.pmsg, best.job.dc, nil
+				}
+			}
+		} else if len(p.readyUnord) > 0 {
+			r := p.readyUnord[0]
+			p.readyUnord = p.readyUnord[1:]
+			return r.job.pmsg, r.job.dc, nil
+		}
+
+		for len(p.inflightSeqs) < p.limit {
+			if !p.dispatchOne() {
+				break
+			}
+		}
+
+		if len(p.inflightSeqs) == 0 {
+			err := p.fetchErr
+			p.fetchErr = nil
+			return nil, 0, err
+		}
+
+		// Unlock while waiting — mirrors the existing unlock/relock pattern
+		// already used for the rate limiter and replay delay elsewhere in
+		// this loop. resultsCh is buffered to p.limit, so every in-flight
+		// goroutine can always deliver its result even if we never come back
+		// to read it (e.g. the consumer is shutting down) — otherwise those
+		// goroutines would leak forever blocked on an unbuffered send.
+		//
+		// Also wait on o.mch (new-message signal): if the pipeline isn't
+		// full yet (dispatchOne ran dry, not because we hit the limit) we
+		// need to wake up and try topping it up again the moment a new
+		// message is available, not only when an in-flight one resolves —
+		// otherwise an early message with a slow callout would block later,
+		// faster ones from ever being dispatched concurrently with it at all.
+		mch := o.mch
+		o.mu.Unlock()
+		select {
+		case res := <-p.resultsCh:
+			o.mu.Lock()
+			if o.closed || o.mset == nil {
+				// Don't touch pending/redeliver state against torn-down
+				// state; the caller's own closed/mset-nil check right after
+				// next() returns will handle the actual exit.
+				return nil, 0, errBadConsumer
+			}
+			delete(p.inflightSeqs, res.job.pmsg.seq)
+			p.handleResult(res)
+		case <-mch:
+			o.mu.Lock()
+		}
+	}
+}
+
+// dispatchOne fetches and dispatches one more message into the pipeline.
+// Returns false if there was nothing available to fetch right now (the error
+// is remembered for next() to surface once the pipeline drains). Lock should
+// be held; the spawned goroutine itself does not touch consumer state.
+func (p *consumerCalloutPipeline) dispatchOne() bool {
+	o := p.o
+	pmsg, dc, err := o.getNextMsg()
+	if pmsg == nil {
+		p.fetchErr = err
+		return false
+	}
+	if dc == 1 {
+		o.npc--
+	}
+	job := &calloutJob{pmsg: pmsg, dc: dc}
+	p.inflightSeqs[pmsg.seq] = struct{}{}
+
+	// Read Subject/Include*/Timeout fresh (unlike Concurrency/Ordered, which
+	// are baked into this pipeline instance and only change when the loop's
+	// resync check replaces it) so a live update to these applies starting
+	// with the very next dispatch on the same pipeline.
+	co := o.cfg.Callout
+	hdr, payload := o.buildCalloutRequest(co, pmsg)
+	qch := p.qch
+	resultsCh := p.resultsCh
+	go func() {
+		goDecision, reason := o.runCallout(co, hdr, payload, qch)
+		resultsCh <- &calloutResult{job: job, goDecision: goDecision, reason: reason}
+	}()
+	return true
+}
+
+// handleResult applies a completed callout's outcome. A rejection is always
+// applied immediately regardless of ordered/unordered — a declined message
+// never needs release-ordering since it isn't being delivered to anyone, and
+// its retry (if any) will simply become in-flight again under the same
+// sequence. An acceptance becomes visible to next()'s release logic. Lock
+// should be held.
+func (p *consumerCalloutPipeline) handleResult(res *calloutResult) {
+	o := p.o
+	job := res.job
+	if !res.goDecision {
+		o.returnMsgUndelivered(job.pmsg, job.dc)
+		o.sendCalloutRejectedAdvisory(job.pmsg.seq, job.dc, res.reason)
+		job.pmsg.returnToPool()
+		// Unlike the pull-mode "no one waiting" rollback, nothing else is
+		// guaranteed to wake this loop again (push mode has no equivalent to
+		// a new pull request arriving), so signal explicitly.
+		o.signalNewMessages()
+		return
+	}
+	if p.ordered {
+		p.readyOrd[job.pmsg.seq] = res
+	} else {
+		p.readyUnord = append(p.readyUnord, res)
+	}
 }
 
 func (o *consumer) sendDeleteAdvisoryLocked() {
@@ -2644,10 +2923,15 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 		o.updateDeliverSubjectLocked(cfg.DeliverSubject)
 	}
 
-	// Callout: (re)create the internal reply subscription if it was
-	// added, removed, or repointed at a different subject. Only meaningful
-	// while we are the leader; otherwise setLeader(true) will set it up fresh.
-	if !consumerCalloutEqual(cfg.Callout, o.cfg.Callout) && o.isLeader() {
+	// Callout: (re)create the internal reply subscription only when whether we
+	// need one at all changes (none configured <-> configured-and-not-direct-
+	// forward <-> direct-forward, which needs none). The reply subscription is
+	// deliberately NOT tied to Subject/Include*/Timeout/Concurrency/Ordered —
+	// those are read fresh from o.cfg.Callout on every dispatch, so changing
+	// them takes effect on the very next message with no subscription churn.
+	// Tearing down and recreating the subscription on every such change would
+	// silently drop in-flight requests still using the old reply subject.
+	if needsCalloutSubLocked(cfg.Callout) != needsCalloutSubLocked(o.cfg.Callout) && o.isLeader() {
 		o.cfg.Callout = cfg.Callout
 		if err := o.setupCalloutSubLocked(); err != nil {
 			return err
@@ -5306,6 +5590,13 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	inch := o.inch
 	o.mu.Unlock()
 
+	// Delivery callout pipeline, if configured; re-synced against o.cfg.Callout
+	// at the top of every loop iteration below so a live config change —
+	// including attaching/detaching/repointing Callout entirely, or changing
+	// Concurrency/Ordered — takes effect on the very next message, not just
+	// on the next leadership term.
+	var pipeline *consumerCalloutPipeline
+
 	// Grab the stream's retention policy and name
 	mset.cfgMu.RLock()
 	stream, rp := mset.cfg.Name, mset.cfg.Retention
@@ -5336,6 +5627,19 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// Clear last error.
 		err = nil
 
+		// Re-sync the callout pipeline against the current config every
+		// iteration so a live change — attach/detach/repoint Callout
+		// entirely, or a different Concurrency/Ordered — takes effect on the
+		// very next message. Recomputing this is cheap next to the actual
+		// network round trip that dominates each iteration, so there's no
+		// need to only apply it on the next leadership term.
+		co := o.cfg.Callout
+		if co == nil {
+			pipeline = nil
+		} else if pipeline == nil || pipeline.limit != co.concurrency() || pipeline.ordered != co.ordered() {
+			pipeline = newConsumerCalloutPipeline(o, qch)
+		}
+
 		// If the consumer is paused then stop sending.
 		if o.cfg.PauseUntil != nil && !o.cfg.PauseUntil.IsZero() && time.Now().Before(*o.cfg.PauseUntil) {
 			// If the consumer is paused and we haven't reached the deadline yet then
@@ -5353,8 +5657,18 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			goto waitForMsgs
 		}
 
-		// Grab our next msg.
-		pmsg, dc, err = o.getNextMsg()
+		// Grab our next msg. When a (non-direct-forward) delivery callout is
+		// configured, the pipeline manages fetching, concurrency, gating and
+		// release ordering, and does its own npc-- bookkeeping at dispatch
+		// time; otherwise fetch directly and update npc here as before.
+		if pipeline != nil {
+			pmsg, dc, err = pipeline.next()
+		} else {
+			pmsg, dc, err = o.getNextMsg()
+			if err == nil && pmsg != nil && dc == 1 {
+				o.npc--
+			}
+		}
 
 		// We can release the lock now under getNextMsg so need to check this condition again here.
 		if o.closed || o.mset == nil {
@@ -5378,37 +5692,6 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 					s.Errorf("Received an error looking up message for consumer '%s > %s > %s': %v",
 						o.mset.acc, stream, o.cfg.Name, err)
 				}
-				goto waitForMsgs
-			}
-		}
-
-		// Update our cached num pending here first.
-		if dc == 1 {
-			o.npc--
-		}
-
-		// If a delivery callout is configured, gate this message on a go/no-go
-		// reply before it is truncated for HeadersOnly or resolved to a push/pull
-		// destination. This covers both push and pull consumers uniformly since
-		// neither dsubj nor a pull request's batch/byte budget have been touched yet.
-		if co := o.cfg.Callout; co != nil {
-			hdr, payload := o.buildCalloutRequest(co, pmsg)
-			o.mu.Unlock()
-			goDecision, reason := o.runCallout(co, hdr, payload, qch)
-			o.mu.Lock()
-			if o.closed || o.mset == nil {
-				o.mu.Unlock()
-				return
-			}
-			if !goDecision {
-				o.returnMsgUndelivered(pmsg, dc)
-				o.sendCalloutRejectedAdvisory(pmsg.seq, dc, reason)
-				pmsg.returnToPool()
-				pmsg = nil
-				// Unlike the pull-mode "no one waiting" rollback, nothing else
-				// is guaranteed to wake this loop again (push mode has no
-				// equivalent to a new pull request arriving), so signal explicitly.
-				o.signalNewMessages()
 				goto waitForMsgs
 			}
 		}
@@ -5710,12 +5993,30 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 		return
 	}
 
+	pmsg.dsubj, pmsg.reply, pmsg.o = dsubj, ackReply, o
+
+	o.finishDeliveryBookkeeping(pmsg, dc, rp)
+
+	// Send message.
+	if o.replicateDeliveries() {
+		o.addReplicatedQueuedMsg(pmsg)
+	} else {
+		o.outq.send(pmsg)
+	}
+}
+
+// finishDeliveryBookkeeping does all consumer-side accounting for a message
+// being delivered (dseq assignment, delivered/pending tracking, flow-control
+// and pull-inactivity bookkeeping) without putting anything on the wire.
+// pmsg.dsubj/pmsg.reply must already be set (used for size/flow-control math).
+// Shared by deliverMsg (which sends afterward) and direct-forward dispatch
+// (which never sends via the server — the external callout does). Lock should
+// be held; must not touch pmsg after this returns other than to dispose of it.
+func (o *consumer) finishDeliveryBookkeeping(pmsg *jsPubMsg, dc uint64, rp RetentionPolicy) {
 	dseq := o.dseq
 	o.dseq++
 
-	pmsg.dsubj, pmsg.reply, pmsg.o = dsubj, ackReply, o
 	psz := pmsg.size()
-
 	if o.maxpb > 0 {
 		o.pbytes += psz
 	}
@@ -5723,7 +6024,7 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 	mset := o.mset
 	ap := o.cfg.AckPolicy
 
-	// Cant touch pmsg after this sending so capture what we need.
+	// Cant touch pmsg after this so capture what we need.
 	seq, ts := pmsg.seq, pmsg.ts
 
 	// Update delivered first.
@@ -5734,13 +6035,6 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 	} else if ap == AckNone {
 		o.adflr = dseq
 		o.asflr = seq
-	}
-
-	// Send message.
-	if o.replicateDeliveries() {
-		o.addReplicatedQueuedMsg(pmsg)
-	} else {
-		o.outq.send(pmsg)
 	}
 
 	// Flow control.

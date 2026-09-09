@@ -2138,5 +2138,15 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerCalloutConcurrencyNegativeErr",
+    "code": 400,
+    "error_code": 10216,
+    "description": "consumer callout concurrency cannot be negative",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

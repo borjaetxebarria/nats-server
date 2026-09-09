@@ -104,6 +104,9 @@ const (
 	// JSConsumerBadDurableNameErr durable name can not contain '.', '*', '>'
 	JSConsumerBadDurableNameErr ErrorIdentifier = 10103
 
+	// JSConsumerCalloutConcurrencyNegativeErr consumer callout concurrency cannot be negative
+	JSConsumerCalloutConcurrencyNegativeErr ErrorIdentifier = 10216
+
 	// JSConsumerCalloutInvalidSubjectErr consumer callout subject must be a valid publishable subject
 	JSConsumerCalloutInvalidSubjectErr ErrorIdentifier = 10214
 
@@ -683,6 +686,7 @@ var (
 		JSConsumerAlreadyExists:                      {Code: 400, ErrCode: 10148, Description: "consumer already exists"},
 		JSConsumerBackOffNegativeErr:                 {Code: 400, ErrCode: 10184, Description: "consumer backoff needs to be positive"},
 		JSConsumerBadDurableNameErr:                  {Code: 400, ErrCode: 10103, Description: "durable name can not contain '.', '*', '>'"},
+		JSConsumerCalloutConcurrencyNegativeErr:      {Code: 400, ErrCode: 10216, Description: "consumer callout concurrency cannot be negative"},
 		JSConsumerCalloutInvalidSubjectErr:           {Code: 400, ErrCode: 10214, Description: "consumer callout subject must be a valid publishable subject"},
 		JSConsumerCalloutSubjectRequiredErr:          {Code: 400, ErrCode: 10213, Description: "consumer callout subject is required"},
 		JSConsumerCalloutTimeoutNegativeErr:          {Code: 400, ErrCode: 10215, Description: "consumer callout timeout cannot be negative"},
@@ -1235,6 +1239,16 @@ func NewJSConsumerBadDurableNameError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSConsumerBadDurableNameErr]
+}
+
+// NewJSConsumerCalloutConcurrencyNegativeError creates a new JSConsumerCalloutConcurrencyNegativeErr error: "consumer callout concurrency cannot be negative"
+func NewJSConsumerCalloutConcurrencyNegativeError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerCalloutConcurrencyNegativeErr]
 }
 
 // NewJSConsumerCalloutInvalidSubjectError creates a new JSConsumerCalloutInvalidSubjectErr error: "consumer callout subject must be a valid publishable subject"
