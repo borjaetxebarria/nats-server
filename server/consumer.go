@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"container/heap"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2162,9 +2163,33 @@ type consumerCalloutPipeline struct {
 	resultsCh chan *calloutResult // buffered to limit; see next()'s shutdown note
 
 	inflightSeqs map[uint64]struct{}      // dispatched, not yet resolved (a rejected-then-retried job keeps reusing its seq)
+	inflightHeap seqHeap                  // lazily-validated min-heap mirroring inflightSeqs' keys, for O(log n) min lookup
 	readyOrd     map[uint64]*calloutResult // accepted, awaiting release order (ordered mode), keyed by seq
+	readyHeap    seqHeap                  // lazily-validated min-heap mirroring readyOrd's keys
 	readyUnord   []*calloutResult          // accepted, ready to release in any order (unordered mode)
 	fetchErr     error
+}
+
+// seqHeap is a min-heap of sequence numbers used as a lazily-validated index
+// into inflightSeqs/readyOrd: entries may be stale (already removed from the
+// map they mirror) and are discarded on pop when found so. This keeps
+// "what's the smallest key currently in this map" at O(log n) amortized
+// instead of the O(n) linear scan a naive implementation would need on every
+// single next() call — at Concurrency in the hundreds/low-thousands that scan
+// dominates the cost of delivering every message and can make ordered mode
+// slower than no concurrency at all.
+type seqHeap []uint64
+
+func (h seqHeap) Len() int            { return len(h) }
+func (h seqHeap) Less(i, j int) bool  { return h[i] < h[j] }
+func (h seqHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *seqHeap) Push(x any)         { *h = append(*h, x.(uint64)) }
+func (h *seqHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 // newConsumerCalloutPipeline returns nil if co is nil. Lock should be held.
@@ -2188,16 +2213,30 @@ func newConsumerCalloutPipeline(o *consumer, qch chan struct{}) *consumerCallout
 	return p
 }
 
-// minInflightSeq returns the smallest currently in-flight sequence, if any.
-func (p *consumerCalloutPipeline) minInflightSeq() (uint64, bool) {
-	var min uint64
-	found := false
-	for seq := range p.inflightSeqs {
-		if !found || seq < min {
-			min, found = seq, true
+// peekMinInflight returns the smallest currently in-flight sequence, if any,
+// discarding stale heap entries (seqs no longer in inflightSeqs) as it goes.
+func (p *consumerCalloutPipeline) peekMinInflight() (uint64, bool) {
+	for len(p.inflightHeap) > 0 {
+		seq := p.inflightHeap[0]
+		if _, ok := p.inflightSeqs[seq]; ok {
+			return seq, true
 		}
+		heap.Pop(&p.inflightHeap)
 	}
-	return min, found
+	return 0, false
+}
+
+// peekMinReady returns the smallest ready-to-release (seq, result), if any,
+// discarding stale heap entries (seqs no longer in readyOrd) as it goes.
+func (p *consumerCalloutPipeline) peekMinReady() (uint64, *calloutResult, bool) {
+	for len(p.readyHeap) > 0 {
+		seq := p.readyHeap[0]
+		if r, ok := p.readyOrd[seq]; ok {
+			return seq, r, true
+		}
+		heap.Pop(&p.readyHeap)
+	}
+	return 0, nil, false
 }
 
 // next returns the next message approved for normal delivery, exactly like
@@ -2210,15 +2249,9 @@ func (p *consumerCalloutPipeline) next() (*jsPubMsg, uint64, error) {
 	o := p.o
 	for {
 		if p.ordered {
-			var bestSeq uint64
-			var best *calloutResult
-			for seq, r := range p.readyOrd {
-				if best == nil || seq < bestSeq {
-					bestSeq, best = seq, r
-				}
-			}
-			if best != nil {
-				if minSeq, ok := p.minInflightSeq(); !ok || bestSeq < minSeq {
+			if bestSeq, best, ok := p.peekMinReady(); ok {
+				if minSeq, ok := p.peekMinInflight(); !ok || bestSeq < minSeq {
+					heap.Pop(&p.readyHeap)
 					delete(p.readyOrd, bestSeq)
 					return best.job.pmsg, best.job.dc, nil
 				}
@@ -2289,6 +2322,7 @@ func (p *consumerCalloutPipeline) dispatchOne() bool {
 	}
 	job := &calloutJob{pmsg: pmsg, dc: dc}
 	p.inflightSeqs[pmsg.seq] = struct{}{}
+	heap.Push(&p.inflightHeap, pmsg.seq)
 
 	// Read Subject/Include*/Timeout fresh (unlike Concurrency/Ordered, which
 	// are baked into this pipeline instance and only change when the loop's
@@ -2326,6 +2360,7 @@ func (p *consumerCalloutPipeline) handleResult(res *calloutResult) {
 	}
 	if p.ordered {
 		p.readyOrd[job.pmsg.seq] = res
+		heap.Push(&p.readyHeap, job.pmsg.seq)
 	} else {
 		p.readyUnord = append(p.readyUnord, res)
 	}

@@ -16,6 +16,8 @@
 package server
 
 import (
+	"math/rand"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -464,6 +466,69 @@ func TestJetStreamConsumerCalloutPipelineUnordered(t *testing.T) {
 		require_NoError(t, err)
 		if string(m.Data) != want[i] {
 			t.Fatalf("expected out-of-order delivery %v, got %q at position %d", want, m.Data, i)
+		}
+	}
+}
+
+// TestJetStreamConsumerCalloutPipelineOrderedHighConcurrency guards against a
+// real bug found via benchmarking: the ordered-release path originally did an
+// O(n) scan over the in-flight/ready sets on every single release decision,
+// which is fine at small Concurrency but at a few hundred/thousand made
+// ordered mode slower than no concurrency at all (a benchmark run measured
+// concurrency=1024 *underperforming* concurrency=1). The fix (a lazily
+// validated min-heap) needs correctness coverage at a Concurrency high enough
+// to actually exercise many concurrent in-flight/ready entries at once.
+func TestJetStreamConsumerCalloutPipelineOrderedHighConcurrency(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+
+	acc := s.GlobalAccount()
+	mset, err := acc.addStream(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	// Randomized per-message delay shuffles completion order so this only
+	// passes if release ordering is actually enforced under real concurrency,
+	// not just trivially preserved because nothing ever overlaps.
+	_, err = nc.Subscribe("CALLOUT.HIGHCONC", func(m *nats.Msg) {
+		go func() {
+			time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
+			m.Respond(nil)
+		}()
+	})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	deliverSubj := "deliver.highconc"
+	sub, err := nc.SubscribeSync(deliverSubj)
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "HIGHCONC",
+		DeliverSubject: deliverSubj,
+		AckPolicy:      AckExplicit,
+		Callout: &ConsumerCallout{
+			Subject:        "CALLOUT.HIGHCONC",
+			IncludePayload: true,
+			Concurrency:    256,
+			// Ordered defaults to true.
+		},
+	})
+	require_NoError(t, err)
+
+	const total = 500
+	for i := 0; i < total; i++ {
+		sendStreamMsg(t, nc, "foo", strconv.Itoa(i))
+	}
+
+	for i := 0; i < total; i++ {
+		m, err := sub.NextMsg(5 * time.Second)
+		require_NoError(t, err)
+		if got, err := strconv.Atoi(string(m.Data)); err != nil || got != i {
+			t.Fatalf("expected message %d in order, got %q (err=%v)", i, m.Data, err)
 		}
 	}
 }
